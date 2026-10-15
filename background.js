@@ -76,10 +76,6 @@ async function getExistingOrderNumbers() {
   return Array.from(new Set(rows.map((r) => (r[0] ? String(r[0]).trim() : "")).filter(Boolean)));
 }
 
-/**
- * Parses existing Google Sheet rows back into structured Order objects.
- * Preserves the user's checked/unchecked "Arrived?" status and splits any legacy \n cells.
- */
 function parseExistingSheetOrders(existingRows) {
   const orderMap = new Map();
   let currentOrder = null;
@@ -154,11 +150,8 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
   if (getData.error) throw new Error(getData.error.message);
 
   const existingRows = getData.values || [];
-
-  // 1. Parse existing orders from the sheet
   const existingOrdersMap = parseExistingSheetOrders(existingRows);
 
-  // 2. Group newly scraped items by Order Number (deduplicating items within the same order)
   const scrapedOrdersMap = new Map();
   for (const item of scrapedItems) {
     if (!scrapedOrdersMap.has(item.orderNumber)) {
@@ -180,7 +173,6 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
     });
   }
 
-  // 3. Combine new orders and existing orders (preserving unique Order Numbers so spans never overlap)
   let addedOrdersCount = 0;
   const finalOrdersMap = new Map();
 
@@ -208,7 +200,6 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
     }
   }
 
-  // 4. Build the clean multi-row 2D grid and track exact [startRow, endRow) spans
   const allGridRows = [
     [
       "Arrived?",
@@ -225,7 +216,7 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
   ];
 
   const orderSpans = [];
-  let currentRowIdx = 1; // 0-based index (Row 1 is index 0, first data row is index 1)
+  let currentRowIdx = 1;
 
   for (const order of finalOrdersMap.values()) {
     const items =
@@ -270,7 +261,6 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
     currentRowIdx = endRow;
   }
 
-  // 5. Fetch sheet metadata (numeric sheetId, current rowCount, and exact existing merges)
   const metaRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`, {
     headers: { Authorization: `Bearer ${token}` }
   });
@@ -279,22 +269,37 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
   const numericSheetId = targetSheet ? targetSheet.properties.sheetId : 0;
   const currentGridRows = targetSheet?.properties?.gridProperties?.rowCount || 1000;
   const existingMerges = targetSheet?.merges || [];
+  const staleHighlightRuleIndices = (targetSheet?.conditionalFormats || [])
+    .map((rule, index) => ({ rule, index }))
+    .filter(({ rule }) => {
+      const condition = rule.booleanRule?.condition;
+      return (
+        condition?.type === "CUSTOM_FORMULA" &&
+        condition.values?.some(({ userEnteredValue }) => {
+          if (typeof userEnteredValue !== "string") return false;
+          return (
+            userEnteredValue === "=$A2=TRUE" ||
+            userEnteredValue.includes("LOOKUP(2,1/") ||
+            /^=\$A\$\d+=TRUE$/.test(userEnteredValue)
+          );
+        })
+      );
+    })
+    .map(({ index }) => index)
+    .sort((a, b) => b - a);
 
-  // 6. Unbound unmerge: unmerge every existing merge on the sheet AND clear old validations/borders
   const resetRequests = [
-    // Unmerge the ENTIRE sheet tab unconditionally so it can never split a partial merge!
     {
       unmergeCells: {
-        range: {
-          sheetId: numericSheetId
-        }
+        range: { sheetId: numericSheetId }
       }
     },
-    // Also explicitly unmerge each active merge reported by metadata just in case
     ...existingMerges.map((m) => ({
       unmergeCells: { range: m }
     })),
-    // Clear all data validations on Column A across the entire sheet
+    ...staleHighlightRuleIndices.map((index) => ({
+      deleteConditionalFormatRule: { sheetId: numericSheetId, index }
+    })),
     {
       setDataValidation: {
         range: {
@@ -306,7 +311,6 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
         }
       }
     },
-    // Clear all borders in the data range
     {
       updateBorders: {
         range: {
@@ -323,7 +327,6 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
     }
   ];
 
-  // If our new grid has more rows than the sheet currently has, expand the sheet grid first
   if (allGridRows.length + 20 > currentGridRows) {
     resetRequests.push({
       appendDimension: {
@@ -334,7 +337,7 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
     });
   }
 
-  const resetRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+  await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -342,13 +345,7 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
     },
     body: JSON.stringify({ requests: resetRequests })
   });
-  const resetData = await resetRes.json();
-  if (resetData.error) {
-    console.error("Reset batchUpdate error:", resetData.error);
-    throw new Error(`Reset error: ${resetData.error.message}`);
-  }
 
-  // Clear all existing cell values
   await fetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Orders!A1:J${Math.max(currentGridRows, allGridRows.length)}:clear`,
     {
@@ -357,7 +354,6 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
     }
   );
 
-  // 7. Write the clean, normalized multi-row grid starting at A1
   const writeUrl = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Orders!A1?valueInputOption=USER_ENTERED`;
   const writeRes = await fetch(writeUrl, {
     method: "PUT",
@@ -370,16 +366,15 @@ async function syncOrdersWithUserOAuth(scrapedItems) {
   const writeData = await writeRes.json();
   if (writeData.error) throw new Error(writeData.error.message);
 
-  // 8. Apply exact vertical merges, checkboxes, column widths, and borders
   if (allGridRows.length > 1) {
-    await applySheetFormattingAndMerges(token, sheetId, numericSheetId, orderSpans, allGridRows.length);
+    await applySheetFormattingAndMerges(token, sheetId, numericSheetId, orderSpans, allGridRows.length, finalOrdersMap);
   }
 
   const sheetUrl = `https://docs.google.com/spreadsheets/d/${sheetId}/edit`;
   return { added: addedOrdersCount, sheetUrl, isNewSheet };
 }
 
-async function applySheetFormattingAndMerges(token, sheetId, numericSheetId, orderSpans, totalRows) {
+async function applySheetFormattingAndMerges(token, sheetId, numericSheetId, orderSpans, totalRows, finalOrdersMap) {
   const columnWidths = [
     75,  // A: Arrived?
     110, // B: Order Date
@@ -406,12 +401,15 @@ async function applySheetFormattingAndMerges(token, sheetId, numericSheetId, ord
     }
   }));
 
-  // Package-level columns to merge vertically: A(0), B(1), C(2), D(3), I(8), J(9)
   const packageCols = [0, 1, 2, 3, 8, 9];
   const packageRequests = [];
 
-  for (const span of orderSpans) {
-    // 1. Merge each package column vertically across the order's exact card rows
+  const ordersArr = Array.from(finalOrdersMap.values());
+
+  for (let idx = 0; idx < orderSpans.length; idx++) {
+    const span = orderSpans[idx];
+    const orderObj = ordersArr[idx];
+
     if (span.endRow - span.startRow > 1) {
       for (const colIdx of packageCols) {
         packageRequests.push({
@@ -429,7 +427,29 @@ async function applySheetFormattingAndMerges(token, sheetId, numericSheetId, ord
       }
     }
 
-    // 2. Apply Checkbox validation strictly to the top-left anchor cell of the merged range
+    // Write the boolean state separately from the checkbox validation rule.
+    packageRequests.push({
+      updateCells: {
+        range: {
+          sheetId: numericSheetId,
+          startRowIndex: span.startRow,
+          endRowIndex: span.startRow + 1,
+          startColumnIndex: 0,
+          endColumnIndex: 1
+        },
+        rows: [
+          {
+            values: [
+              {
+                userEnteredValue: { boolValue: Boolean(orderObj?.arrived) }
+              }
+            ]
+          }
+        ],
+        fields: "userEnteredValue"
+      }
+    });
+
     packageRequests.push({
       setDataValidation: {
         range: {
@@ -441,12 +461,38 @@ async function applySheetFormattingAndMerges(token, sheetId, numericSheetId, ord
         },
         rule: {
           condition: { type: "BOOLEAN" },
+          strict: true,
           showCustomUi: true
         }
       }
     });
 
-    // 3. Draw a solid bottom border across A-J at the end of each package
+    packageRequests.push({
+      addConditionalFormatRule: {
+        rule: {
+          ranges: [
+            {
+              sheetId: numericSheetId,
+              startRowIndex: span.startRow,
+              endRowIndex: span.endRow,
+              startColumnIndex: 1,
+              endColumnIndex: 10
+            }
+          ],
+          booleanRule: {
+            condition: {
+              type: "CUSTOM_FORMULA",
+              values: [{ userEnteredValue: `=$A$${span.startRow + 1}=TRUE` }]
+            },
+            format: {
+              backgroundColor: { red: 0.82, green: 0.93, blue: 0.85 }
+            }
+          }
+        },
+        index: idx
+      }
+    });
+
     packageRequests.push({
       updateBorders: {
         range: {
@@ -468,7 +514,7 @@ async function applySheetFormattingAndMerges(token, sheetId, numericSheetId, ord
     });
   }
 
-  const batchRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+  const formatRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -594,10 +640,6 @@ async function applySheetFormattingAndMerges(token, sheetId, numericSheetId, ord
       ]
     })
   });
-
-  const batchData = await batchRes.json();
-  if (batchData.error) {
-    console.error("batchUpdate formatting error:", batchData.error);
-    throw new Error(batchData.error.message);
-  }
+  const formatData = await formatRes.json();
+  if (formatData.error) throw new Error(formatData.error.message);
 }
